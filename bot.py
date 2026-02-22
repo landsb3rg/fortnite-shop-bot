@@ -1,6 +1,5 @@
 import os
 import logging
-import asyncio
 import sqlite3
 import requests
 import pytz
@@ -17,7 +16,6 @@ from telegram.ext import (
     ContextTypes
 )
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 
 # ================= НАСТРОЙКИ =================
@@ -182,17 +180,16 @@ def main():
     app.add_handler(CommandHandler("watch", watch))
     app.add_handler(CommandHandler("unwatch", unwatch))
 
-    # Планировщик (3:00 МСК)
-    scheduler = AsyncIOScheduler(timezone=moscow_tz)
-    scheduler.add_job(
-        lambda: asyncio.create_task(send_shop(app)),
-        "cron",
-        hour=3,
-        minute=0,
-    )
-    scheduler.start()
+    # Планировщик через JobQueue (3:00 МСК)
+    job_queue = app.job_queue
 
-    print("🚀 ULTIMATE BOT STARTED")
+    job_queue.run_daily(
+        lambda context: send_shop(context.application),
+        time=datetime.time(hour=3, minute=0, tzinfo=moscow_tz),
+        name="daily_shop"
+    )
+
+    print("🚀 BOT STARTED WITHOUT APSCHEDULER")
 
     app.run_polling()
 
