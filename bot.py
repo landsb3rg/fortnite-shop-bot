@@ -1,4 +1,4 @@
-import asyncio
+
 import requests
 import pytz
 import os
@@ -131,25 +131,28 @@ async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================= MAIN =================
 
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+def main():
+    app = Application.builder().token(TOKEN).build()
 
+    # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("shop", shop))
-    app.add_handler(CommandHandler("watch", watch))
-    app.add_handler(CommandHandler("unwatch", unwatch))
+    app.add_handler(CommandHandler("id", get_chat_id))
+    app.add_handler(CommandHandler("test", test_shop))
 
-    scheduler = AsyncIOScheduler(timezone=moscow_tz)
+    # Планировщик
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
-        lambda: asyncio.create_task(send_shop()),
+        lambda: asyncio.create_task(send_shop(app)),
         "cron",
         hour=3,
-        minute=0
+        minute=0,
     )
     scheduler.start()
 
-    logging.info("ULTIMATE BOT STARTED")
-    await app.run_polling()
+    print("ULTIMATE BOT STARTED")
+
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
