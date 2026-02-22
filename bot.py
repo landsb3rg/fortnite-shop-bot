@@ -3,6 +3,7 @@ import requests
 import pytz
 import os
 import sqlite3
+import logging
 from telegram import (
     Bot,
     InlineKeyboardButton,
@@ -16,6 +17,8 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+logging.basicConfig(level=logging.INFO)
+
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
@@ -24,100 +27,55 @@ API_URL = "https://fortnite-api.com/v2/shop"
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 
-# ==========================
-# DATABASE
-# ==========================
+# ================= DATABASE =================
 
-conn = sqlite3.connect("bot.db")
+conn = sqlite3.connect("bot.db", check_same_thread=False)
 cursor = conn.cursor()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id INTEGER PRIMARY KEY
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS watchlist (
-    user_id INTEGER,
-    skin_name TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS shop_cache (
-    id INTEGER PRIMARY KEY,
-    hash TEXT
-)
-""")
-
+cursor.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)")
+cursor.execute("CREATE TABLE IF NOT EXISTS watchlist (user_id INTEGER, skin TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS cache (id INTEGER PRIMARY KEY, hash TEXT)")
 conn.commit()
 
-# ==========================
-# API
-# ==========================
+# ================= API =================
 
 def get_shop():
     try:
         r = requests.get(API_URL, timeout=10)
-        data = r.json()["data"]
-        return data
+        return r.json()["data"]
     except:
         return None
 
-# ==========================
-# WATCH CHECK
-# ==========================
-
-async def check_watchlist(items):
-    bot = Bot(token=TOKEN)
-    cursor.execute("SELECT user_id, skin_name FROM watchlist")
-    rows = cursor.fetchall()
-
-    for user_id, skin in rows:
-        for item in items:
-            if skin.lower() in item["name"].lower():
-                await bot.send_message(
-                    user_id,
-                    f"🚨 Скин {item['name']} появился в магазине!"
-                )
-
-# ==========================
-# SEND SHOP
-# ==========================
+# ================= SEND SHOP =================
 
 async def send_shop(force=False):
-    bot = Bot(token=TOKEN)
+    bot = Bot(TOKEN)
     data = get_shop()
     if not data:
+        await bot.send_message(ADMIN_ID, "❌ Ошибка API")
         return
 
     shop_hash = data["hash"]
-    image_url = data["image"]
+    image = data["image"]
 
-    cursor.execute("SELECT hash FROM shop_cache WHERE id=1")
+    cursor.execute("SELECT hash FROM cache WHERE id=1")
     row = cursor.fetchone()
 
     if row and row[0] == shop_hash and not force:
         return
 
-    cursor.execute("DELETE FROM shop_cache")
-    cursor.execute("INSERT INTO shop_cache (id, hash) VALUES (1, ?)", (shop_hash,))
+    cursor.execute("DELETE FROM cache")
+    cursor.execute("INSERT INTO cache VALUES (1, ?)", (shop_hash,))
     conn.commit()
 
     items = []
-    for entry in data["entries"][:8]:
-        item = entry["items"][0]
-        items.append({
-            "name": item["name"],
-            "price": entry["finalPrice"],
-            "rarity": item["rarity"]["displayValue"]
-        })
+    for e in data["entries"][:6]:
+        item = e["items"][0]
+        items.append(
+            f"{item['name']} — {e['finalPrice']} V-Bucks"
+        )
 
-    text = "\n".join(
-        [f"{i['name']} — {i['price']} V-Bucks ({i['rarity']})"
-         for i in items]
-    )
+    text = "\n".join(items)
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть магазин", url=SHOP_URL)]
@@ -126,55 +84,60 @@ async def send_shop(force=False):
     cursor.execute("SELECT chat_id FROM chats")
     chats = cursor.fetchall()
 
-    for chat_id in chats:
+    for chat in chats:
         await bot.send_photo(
-            chat_id=chat_id[0],
-            photo=image_url,
+            chat_id=chat[0],
+            photo=image,
             caption=f"🛒 Магазин обновился!\n\n{text}"[:1024],
             reply_markup=keyboard
         )
 
-    await check_watchlist(items)
+    # Проверка отслеживания
+    cursor.execute("SELECT user_id, skin FROM watchlist")
+    watch = cursor.fetchall()
 
-# ==========================
-# COMMANDS
-# ==========================
+    for user_id, skin in watch:
+        for i in items:
+            if skin.lower() in i.lower():
+                await bot.send_message(
+                    user_id,
+                    f"🚨 {skin} появился в магазине!"
+                )
+
+# ================= COMMANDS =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    cursor.execute("INSERT OR IGNORE INTO chats VALUES (?)", (chat_id,))
+    cursor.execute("INSERT OR IGNORE INTO chats VALUES (?)",
+                   (update.effective_chat.id,))
     conn.commit()
-    await update.message.reply_text("✅ Чат подключён к обновлениям!")
+    await update.message.reply_text("✅ Чат подключён!")
 
-async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_shop(force=True)
 
-async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Пример: /watch Travis Scott")
-        return
-
-    skin_name = " ".join(context.args)
-    user_id = update.effective_user.id
-
-    cursor.execute(
-        "INSERT INTO watchlist VALUES (?, ?)",
-        (user_id, skin_name)
-    )
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    skin = " ".join(context.args)
+    cursor.execute("INSERT INTO watchlist VALUES (?, ?)",
+                   (update.effective_user.id, skin))
     conn.commit()
+    await update.message.reply_text(f"👀 Отслеживаем {skin}")
 
-    await update.message.reply_text(f"👀 Теперь отслеживаем: {skin_name}")
+async def unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    skin = " ".join(context.args)
+    cursor.execute("DELETE FROM watchlist WHERE user_id=? AND skin=?",
+                   (update.effective_user.id, skin))
+    conn.commit()
+    await update.message.reply_text(f"❌ Больше не отслеживаем {skin}")
 
-# ==========================
-# MAIN
-# ==========================
+# ================= MAIN =================
 
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("shop", shop_cmd))
-    app.add_handler(CommandHandler("watch", watch_cmd))
+    app.add_handler(CommandHandler("shop", shop))
+    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("unwatch", unwatch))
 
     scheduler = AsyncIOScheduler(timezone=moscow_tz)
     scheduler.add_job(
@@ -185,7 +148,7 @@ async def main():
     )
     scheduler.start()
 
-    print("PRO MAX BOT STARTED")
+    logging.info("ULTIMATE BOT STARTED")
     await app.run_polling()
 
 if __name__ == "__main__":
