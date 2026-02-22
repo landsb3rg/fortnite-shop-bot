@@ -2,7 +2,7 @@ import asyncio
 import requests
 import pytz
 import os
-import json
+import sqlite3
 from telegram import (
     Bot,
     InlineKeyboardButton,
@@ -17,180 +17,176 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = os.getenv("TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 SHOP_URL = "https://www.fortnite.com/item-shop"
 API_URL = "https://fortnite-api.com/v2/shop"
-CACHE_FILE = "shop_cache.json"
 
 moscow_tz = pytz.timezone("Europe/Moscow")
 
+# ==========================
+# DATABASE
+# ==========================
 
-# =====================
-# Safe request
-# =====================
+conn = sqlite3.connect("bot.db")
+cursor = conn.cursor()
 
-def safe_request(url):
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS chats (
+    chat_id INTEGER PRIMARY KEY
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS watchlist (
+    user_id INTEGER,
+    skin_name TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS shop_cache (
+    id INTEGER PRIMARY KEY,
+    hash TEXT
+)
+""")
+
+conn.commit()
+
+# ==========================
+# API
+# ==========================
+
+def get_shop():
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
+        r = requests.get(API_URL, timeout=10)
+        data = r.json()["data"]
+        return data
+    except:
         return None
 
+# ==========================
+# WATCH CHECK
+# ==========================
 
-# =====================
-# Cache
-# =====================
+async def check_watchlist(items):
+    bot = Bot(token=TOKEN)
+    cursor.execute("SELECT user_id, skin_name FROM watchlist")
+    rows = cursor.fetchall()
 
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
-        return {}
-    with open(CACHE_FILE, "r") as f:
-        return json.load(f)
+    for user_id, skin in rows:
+        for item in items:
+            if skin.lower() in item["name"].lower():
+                await bot.send_message(
+                    user_id,
+                    f"🚨 Скин {item['name']} появился в магазине!"
+                )
 
-def save_cache(data):
-    with open(CACHE_FILE, "w") as f:
-        json.dump(data, f)
+# ==========================
+# SEND SHOP
+# ==========================
 
-
-# =====================
-# Shop data
-# =====================
-
-def get_shop_data():
-    data = safe_request(API_URL)
+async def send_shop(force=False):
+    bot = Bot(token=TOKEN)
+    data = get_shop()
     if not data:
-        return None, None, []
-
-    data = data["data"]
+        return
 
     shop_hash = data["hash"]
     image_url = data["image"]
 
+    cursor.execute("SELECT hash FROM shop_cache WHERE id=1")
+    row = cursor.fetchone()
+
+    if row and row[0] == shop_hash and not force:
+        return
+
+    cursor.execute("DELETE FROM shop_cache")
+    cursor.execute("INSERT INTO shop_cache (id, hash) VALUES (1, ?)", (shop_hash,))
+    conn.commit()
+
     items = []
-    for entry in data["entries"]:
-        name = entry["items"][0]["name"]
-        rarity = entry["items"][0]["rarity"]["displayValue"]
-        price = entry["finalPrice"]
+    for entry in data["entries"][:8]:
+        item = entry["items"][0]
         items.append({
-            "name": name,
-            "rarity": rarity,
-            "price": price
+            "name": item["name"],
+            "price": entry["finalPrice"],
+            "rarity": item["rarity"]["displayValue"]
         })
 
-    return shop_hash, image_url, items
-
-
-# =====================
-# Send shop
-# =====================
-
-async def send_shop(chat_id, force=False):
-    bot = Bot(token=TOKEN)
-    shop_hash, image_url, items = get_shop_data()
-
-    if not shop_hash:
-        await bot.send_message(ADMIN_ID, "❌ Ошибка получения магазина")
-        return
-
-    cache = load_cache()
-
-    if cache.get("last_hash") == shop_hash and not force:
-        return
-
-    save_cache({"last_hash": shop_hash})
-
-    top_items = items[:8]
-    text_items = "\n".join(
+    text = "\n".join(
         [f"{i['name']} — {i['price']} V-Bucks ({i['rarity']})"
-         for i in top_items]
+         for i in items]
     )
-
-    caption = f"""🛒 Магазин обновился!
-
-🔥 Топ предметы:
-{text_items}
-"""
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Открыть магазин", url=SHOP_URL)]
     ])
 
-    await bot.send_photo(
-        chat_id=chat_id,
-        photo=image_url,
-        caption=caption[:1024],
-        reply_markup=keyboard
-    )
+    cursor.execute("SELECT chat_id FROM chats")
+    chats = cursor.fetchall()
 
-    await bot.send_message(ADMIN_ID, "✅ Магазин опубликован")
+    for chat_id in chats:
+        await bot.send_photo(
+            chat_id=chat_id[0],
+            photo=image_url,
+            caption=f"🛒 Магазин обновился!\n\n{text}"[:1024],
+            reply_markup=keyboard
+        )
 
+    await check_watchlist(items)
 
-# =====================
-# Commands
-# =====================
+# ==========================
+# COMMANDS
+# ==========================
 
-async def shop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_shop(update.effective_chat.id, force=True)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    cursor.execute("INSERT OR IGNORE INTO chats VALUES (?)", (chat_id,))
+    conn.commit()
+    await update.message.reply_text("✅ Чат подключён к обновлениям!")
 
-async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, _, items = get_shop_data()
-    text = "\n".join(
-        [f"{i['name']} — {i['price']} ({i['rarity']})"
-         for i in items[:10]]
-    )
-    await update.message.reply_text("🔥 Текущие предметы:\n\n" + text)
+async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_shop(force=True)
 
-async def rarity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Пример: /rarity Epic")
+        await update.message.reply_text("Пример: /watch Travis Scott")
         return
 
-    rarity_filter = context.args[0].lower()
-    _, _, items = get_shop_data()
+    skin_name = " ".join(context.args)
+    user_id = update.effective_user.id
 
-    filtered = [
-        i for i in items
-        if i["rarity"].lower() == rarity_filter
-    ]
-
-    if not filtered:
-        await update.message.reply_text("Нет предметов этой редкости.")
-        return
-
-    text = "\n".join(
-        [f"{i['name']} — {i['price']} V-Bucks"
-         for i in filtered]
+    cursor.execute(
+        "INSERT INTO watchlist VALUES (?, ?)",
+        (user_id, skin_name)
     )
+    conn.commit()
 
-    await update.message.reply_text(f"🎯 {rarity_filter.upper()} предметы:\n\n{text}")
+    await update.message.reply_text(f"👀 Теперь отслеживаем: {skin_name}")
 
-
-# =====================
-# Main
-# =====================
+# ==========================
+# MAIN
+# ==========================
 
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("shop", shop_command))
-    app.add_handler(CommandHandler("new", new_command))
-    app.add_handler(CommandHandler("rarity", rarity_command))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("shop", shop_cmd))
+    app.add_handler(CommandHandler("watch", watch_cmd))
 
     scheduler = AsyncIOScheduler(timezone=moscow_tz)
     scheduler.add_job(
-        lambda: asyncio.create_task(send_shop(CHAT_ID)),
+        lambda: asyncio.create_task(send_shop()),
         "cron",
         hour=3,
         minute=0
     )
     scheduler.start()
 
-    print("MEGA BOT STARTED")
+    print("PRO MAX BOT STARTED")
     await app.run_polling()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
